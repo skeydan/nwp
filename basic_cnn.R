@@ -6,20 +6,11 @@ library(tensorflow)
 library(keras)
 library(tfdatasets)
 library(tfautograph)
+tb <- import("tensorboard")
+library(tidyverse)
 
 builtins <- import_builtins(convert = FALSE)
-
 xr <- import("xarray")
-z500 <-
-  xr$open_mfdataset("../weatherbench/geopotential_500/*.nc", combine = "by_coords")
-z500
-z500$z
-
-z500$z$isel(time = 0L)$plot()
-
-climatology <- z500$sel(time = "2016")$mean('time')$load()
-climatology$z$plot()
-
 
 # Data prep ---------------------------------------------------------------
 
@@ -66,10 +57,10 @@ test <- abind::abind(z500_test$values, t850_test$values, along = 4)
 test[, , , 1] <- (test[, , , 1] - level_means[1]) / level_sds[1]
 test[, , , 2] <- (test[, , , 2] - level_means[2]) / level_sds[2]
 
-lead_time <- 6
-n_samples <- dim(train)[1] - lead_time
+lead_time <- 3 * 24 # 3d
 batch_size <- 32
 
+n_samples <- dim(train)[1] - lead_time
 train_x <- train %>%
   tensor_slices_dataset() %>%
   dataset_take(n_samples)
@@ -96,9 +87,19 @@ valid_y <- valid %>%
   dataset_skip(lead_time)
 
 valid_ds <- zip_datasets(valid_x, valid_y) %>%
-  dataset_shuffle(buffer_size = n_samples) %>%
   dataset_batch(batch_size = batch_size, drop_remainder = TRUE)
 
+n_samples <- dim(test)[1] - lead_time
+test_x <- test %>%
+  tensor_slices_dataset() %>%
+  dataset_take(n_samples)
+
+test_y <- test %>%
+  tensor_slices_dataset() %>%
+  dataset_skip(lead_time)
+
+test_ds <- zip_datasets(test_x, test_y) %>%
+  dataset_batch(batch_size = batch_size, drop_remainder = TRUE)
 
 
 # Model -------------------------------------------------------------------
@@ -209,7 +210,7 @@ optimizer <- optimizer_adam()
 
 train_loss <- tf$keras$metrics$Mean(name='train_loss')
 
-valid_loss <- tf$keras$metrics$Mean(name='test_loss')
+valid_loss <- tf$keras$metrics$Mean(name='valid_loss')
 
 train_step <- function(train_batch) {
 
@@ -234,28 +235,121 @@ valid_step <- function(valid_batch) {
   valid_loss(l)
 }
 
-training_loop <- tf_function(autograph(function(train_ds, valid_ds) {
+training_loop <- tf_function(autograph(function(train_ds, valid_ds, epoch) {
   
   for (train_batch in train_ds) {
     train_step(train_batch)
   }
   
   for (valid_batch in valid_ds) {
-    valid_step(valid_batch[[1]], valid_batch[[2]])
+    valid_step(valid_batch)
   }
   
-  tf$print("MSE: train: ", train_loss$result(), ", validation: ", valid_loss$result())
+  #tf$print("MSE: train: ", train_loss$result(), ", validation: ", valid_loss$result())
+  with (writer$as_default(), {
+    tf$summary$scalar("train_loss", train_loss$result(), epoch)
+    tf$summary$scalar("valid_loss", valid_loss$result(), epoch)
+  })
   
   train_loss$reset_states()
   valid_loss$reset_states()
   
 }))
 
-for (epoch in 1:5) {
+unlink("logs", recursive = TRUE)
+writer <- tf$summary$create_file_writer("logs")
+
+n_epochs <- 1
+
+for (epoch in 1:n_epochs) {
   cat("Epoch: ", epoch, " -----------\n")
-  training_loop(train_ds, valid_ds)  
+  training_loop(train_ds, valid_ds, epoch)  
+  writer$flush()
+}
+
+acc <- tb$backend$event_processing$event_accumulator$EventAccumulator("logs")
+acc$Reload()
+acc$Tags()
+train_losses <- purrr::map(acc$Tensors("train_loss"), function(t) tf$make_ndarray(t$tensor_proto))
+valid_losses <- purrr::map(acc$Tensors("valid_loss"), function(t) tf$make_ndarray(t$tensor_proto))
+train_losses
+valid_losses
+
+history <- data.frame(epoch = as.factor(1:n_epochs), training = unlist(train_losses), validation = unlist(valid_losses)) 
+history %>% pivot_longer(-epoch, names_to = "phase") %>%
+  ggplot(aes(x = epoch, y = value, color = phase)) + geom_point() +
+  theme_classic() +
+  scale_color_manual(values = c("#00FF7F", "#593780")) +
+  ggtitle("Mean squared error (training/validation, lead time = 3 days)")
+
+
+# Metrics -----------------------------------------------------------------
+
+deg2rad <- function(d) {
+  (d / 180) * pi
+}
+
+# Latitude weighted root mean squared error
+weighted_rmse <- function(forecast, ground_truth) {
+  error <- forecast$values - ground_truth$values
+  weights_lat <- cos(deg2rad(ground_truth$lat$values))
+  weights_lat <- weights_lat / mean(weights_lat)
+  np <- import("numpy", convert = FALSE)
+  wl <- r_to_py(weights_lat)$reshape(c(1L,1L,32L,1L))
+  e <- r_to_py(error)
+  np$sqrt((np$multiply(np$square(e), wl))$mean(axis = tuple(1L, 2L, 3L)))
 }
 
 
+# Weekly climatology ----------------------------------------------------
+
+train_xr <- xr$merge(list(t850_train, z500_train))
+# https://en.wikipedia.org/wiki/ISO_week_date
+
+weekly_averages <- train_xr$groupby("time.week")$mean("time")
+
+test_xr <- xr$merge(list(t850_test, z500_test))
+test_time <- test_xr$time
+
+fc_list <- vector(mode = "list", length = test_time$size)
+for (t in 1:test_time$size) {
+  fc_list[[t]] <- weekly_averages$sel(week = test_time[t-1]$time.week)
+}
+
+weekly_clim_preds <- xr$concat(fc_list, dim = test_time)
+
+wrmse <- weighted_rmse(weekly_clim_preds$to_array(), test_xr$to_array())
+# result reported on github uses weekly climatology from whole dataset
+#[  4.0963539  983.51442889]
+
+
+
+# persistence forecast ----------------------------------------------------
+
+persistence_forecast <- test_xr$isel(time = builtins$slice(0L, as.integer(-lead_time)))
+sel <- test_xr$isel(time = builtins$slice(as.integer(lead_time), test_xr$time$size))
+wrmse <- weighted_rmse(persistence_forecast$to_array(), sel$to_array())
+# [  4.2913616  935.91602924]
+
+
+# CNN forecasts -------------------------------------------------------------
+
+test_loss <- tf$keras$metrics$Mean(name='test_loss')
+
+preds_list <- vector(mode = "list", length = dim(test)[1])
+
+test_step <- function(test_batch) {
+  predictions <- model(test_batch[[1]])
+  l <- loss(test_batch[[2]], predictions)
+  
+  test_loss(l)
+}
+
+test_iterator <- as_iterator(test_ds) 
+while (TRUE) {
+  
+}
+
+# Unnormalize
 
 
