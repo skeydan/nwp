@@ -7,53 +7,108 @@ library(keras)
 library(tfdatasets)
 library(tfautograph)
 tb <- import("tensorboard")
+
 library(tidyverse)
+library(lubridate)
+# https://ropensci.org/blog/2019/11/05/tidync/
+library(tidync)
+
 
 builtins <- import_builtins(convert = FALSE)
-xr <- import("xarray")
 
 # Data prep ---------------------------------------------------------------
 
+path <- '../weatherbench/'
 
-load_data <- function(path, var, years) {
-  ds <-
-    xr$open_mfdataset(paste0(path, "*.nc"), combine = 'by_coords')[[var]]
-  ds <- ds$drop('level')
-  ds$sel(time = years)
-}
-
-path = '../weatherbench/geopotential_500/'
+tidync(paste0(
+  path,
+  "geopotential_500/geopotential_500hPa_2015_5.625deg.nc"
+)) %>% hyper_array()
 z500_train <-
-  load_data(path, "z", years =  builtins$slice("2015", '2015'))
-z500_valid <-
-  load_data(path, "z", years =  builtins$slice("2016", '2016'))
-z500_test <-
-  load_data(path, "z", years =  builtins$slice("2017", '2018'))
+  (tidync(
+    paste0(
+      path,
+      "geopotential_500/geopotential_500hPa_2015_5.625deg.nc"
+    )
+  ) %>%
+    hyper_array())[[1]]
+dim(z500_train)
+image(
+  z500_train[, , 1],
+  col = hcl.colors(20, "viridis"),
+  xaxt = 'n',
+  yaxt = 'n',
+  main = "500hPa geopotential"
+)
 
-
-
-path = '../weatherbench/temperature_850/'
+tidync(paste0(path, "temperature_850/temperature_850hPa_2015_5.625deg.nc")) %>% hyper_array()
 t850_train <-
-  load_data(path, "t", years =  builtins$slice("2015", '2015'))
+  (tidync(
+    paste0(path, "temperature_850/temperature_850hPa_2015_5.625deg.nc")
+  ) %>%
+    hyper_array())[[1]]
+image(
+  t850_train[, , 1],
+  col = hcl.colors(20, "YlOrRd", rev = TRUE),
+  xaxt = 'n',
+  yaxt = 'n',
+  main = "850hPa temperature"
+)
+
+z500_valid <-
+  (tidync(
+    paste0(
+      path,
+      "geopotential_500/geopotential_500hPa_2016_5.625deg.nc"
+    )
+  ) %>%
+    hyper_array())[[1]]
 t850_valid <-
-  load_data(path, "t", years =  builtins$slice("2016", '2016'))
+  (tidync(
+    paste0(path, "temperature_850/temperature_850hPa_2016_5.625deg.nc")
+  ) %>%
+    hyper_array())[[1]]
+
+z500_test <-
+  (tidync(
+    paste0(
+      path,
+      "geopotential_500/geopotential_500hPa_2017_5.625deg.nc"
+    )
+  ) %>%
+    hyper_array())[[1]]
 t850_test <-
-  load_data(path, "t", years =  builtins$slice("2017", '2018'))
+  (tidync(
+    paste0(path, "temperature_850/temperature_850hPa_2017_5.625deg.nc")
+  ) %>%
+    hyper_array())[[1]]
 
+train_all <- abind::abind(z500_train, t850_train, along = 4)
+dim(train_all)
+train_all <- aperm(train_all, perm = c(3, 2, 1, 4))
+dim(train_all)
 
-train <-
-  abind::abind(z500_train$values, t850_train$values, along = 4)
-level_means <- apply(train, 4, mean)
-level_sds <- apply(train, 4, sd)
+level_means <- apply(train_all, 4, mean)
+level_means
+level_sds <- apply(train_all, 4, sd)
+level_sds
+
+train <- train_all
 train[, , , 1] <- (train[, , , 1] - level_means[1]) / level_sds[1]
 train[, , , 2] <- (train[, , , 2] - level_means[2]) / level_sds[2]
 
-valid <-
-  abind::abind(z500_valid$values, t850_valid$values, along = 4)
+
+valid_all <- abind::abind(z500_valid, t850_valid, along = 4)
+valid_all <- aperm(valid_all, perm = c(3, 2, 1, 4))
+
+valid <- valid_all
 valid[, , , 1] <- (valid[, , , 1] - level_means[1]) / level_sds[1]
 valid[, , , 2] <- (valid[, , , 2] - level_means[2]) / level_sds[2]
 
-test <- abind::abind(z500_test$values, t850_test$values, along = 4)
+test_all <- abind::abind(z500_test, t850_test, along = 4)
+test_all <- aperm(test_all, perm = c(3, 2, 1, 4))
+
+test <- test_all
 test[, , , 1] <- (test[, , , 1] - level_means[1]) / level_sds[1]
 test[, , , 2] <- (test[, , , 2] - level_means[2]) / level_sds[2]
 
@@ -74,8 +129,8 @@ train_ds <- zip_datasets(train_x, train_y) %>%
   dataset_batch(batch_size = batch_size, drop_remainder = TRUE)
 
 b <- as_iterator(train_ds) %>% iter_next()
-b[[1]][ , 1, 1, 2]
-b[[2]][ , 1, 1, 2]
+b[[1]][, 1, 1, 1]
+b[[2]][, 1, 1, 1]
 
 n_samples <- dim(valid)[1] - lead_time
 valid_x <- valid %>%
@@ -137,7 +192,8 @@ periodic_conv_2d <- function(filters,
                              kernel_size,
                              name = NULL) {
   keras_model_custom(name = name, function(self) {
-    self$padding <- periodic_padding_2d(pad_width = (kernel_size - 1) / 2)
+    self$padding <-
+      periodic_padding_2d(pad_width = (kernel_size - 1) / 2)
     self$conv <-
       layer_conv_2d(filters = filters,
                     kernel_size = kernel_size,
@@ -170,7 +226,7 @@ periodic_cnn <- function(filters = c(64, 64, 64, 64, 2),
     self$conv2 <-
       periodic_conv_2d(filters = filters[2], kernel_size = kernel_size[2])
     self$act2 <- layer_activation_leaky_relu()
-    self$drop2 <- layer_dropout(rate =dropout[2])
+    self$drop2 <- layer_dropout(rate = dropout[2])
     self$conv3 <-
       periodic_conv_2d(filters = filters[3], kernel_size = kernel_size[3])
     self$act3 <- layer_activation_leaky_relu()
@@ -205,25 +261,23 @@ model <- periodic_cnn()
 
 # Training ----------------------------------------------------------------
 
-loss <- tf$keras$losses$MeanSquaredError(reduction = tf$keras$losses$Reduction$SUM)
+loss <-
+  tf$keras$losses$MeanSquaredError(reduction = tf$keras$losses$Reduction$SUM)
 optimizer <- optimizer_adam()
 
-train_loss <- tf$keras$metrics$Mean(name='train_loss')
+train_loss <- tf$keras$metrics$Mean(name = 'train_loss')
 
-valid_loss <- tf$keras$metrics$Mean(name='valid_loss')
+valid_loss <- tf$keras$metrics$Mean(name = 'valid_loss')
 
 train_step <- function(train_batch) {
-
   with (tf$GradientTape() %as% tape, {
     predictions <- model(train_batch[[1]])
     l <- loss(train_batch[[2]], predictions)
   })
-
+  
   gradients <- tape$gradient(l, model$trainable_variables)
-  optimizer$apply_gradients(purrr::transpose(list(
-    gradients, model$trainable_variables
-  )))
-
+  optimizer$apply_gradients(purrr::transpose(list(gradients, model$trainable_variables)))
+  
   train_loss(l)
   
 }
@@ -235,47 +289,57 @@ valid_step <- function(valid_batch) {
   valid_loss(l)
 }
 
-training_loop <- tf_function(autograph(function(train_ds, valid_ds, epoch) {
-  
-  for (train_batch in train_ds) {
-    train_step(train_batch)
-  }
-  
-  for (valid_batch in valid_ds) {
-    valid_step(valid_batch)
-  }
-  
-  #tf$print("MSE: train: ", train_loss$result(), ", validation: ", valid_loss$result())
-  with (writer$as_default(), {
-    tf$summary$scalar("train_loss", train_loss$result(), epoch)
-    tf$summary$scalar("valid_loss", valid_loss$result(), epoch)
-  })
-  
-  train_loss$reset_states()
-  valid_loss$reset_states()
-  
-}))
+training_loop <-
+  tf_function(autograph(function(train_ds, valid_ds, epoch) {
+    for (train_batch in train_ds) {
+      train_step(train_batch)
+    }
+    
+    for (valid_batch in valid_ds) {
+      valid_step(valid_batch)
+    }
+    
+    #tf$print("MSE: train: ", train_loss$result(), ", validation: ", valid_loss$result())
+    with (writer$as_default(), {
+      tf$summary$scalar("train_loss", train_loss$result(), epoch)
+      tf$summary$scalar("valid_loss", valid_loss$result(), epoch)
+    })
+    
+    train_loss$reset_states()
+    valid_loss$reset_states()
+    
+  }))
 
 unlink("logs", recursive = TRUE)
 writer <- tf$summary$create_file_writer("logs")
 
-n_epochs <- 1
+n_epochs <- 5
 
 for (epoch in 1:n_epochs) {
   cat("Epoch: ", epoch, " -----------\n")
-  training_loop(train_ds, valid_ds, epoch)  
+  training_loop(train_ds, valid_ds, epoch)
   writer$flush()
 }
 
-acc <- tb$backend$event_processing$event_accumulator$EventAccumulator("logs")
+acc <-
+  tb$backend$event_processing$event_accumulator$EventAccumulator("logs")
 acc$Reload()
 acc$Tags()
-train_losses <- purrr::map(acc$Tensors("train_loss"), function(t) tf$make_ndarray(t$tensor_proto))
-valid_losses <- purrr::map(acc$Tensors("valid_loss"), function(t) tf$make_ndarray(t$tensor_proto))
+train_losses <-
+  purrr::map(acc$Tensors("train_loss"), function(t)
+    tf$make_ndarray(t$tensor_proto))
+valid_losses <-
+  purrr::map(acc$Tensors("valid_loss"), function(t)
+    tf$make_ndarray(t$tensor_proto))
 train_losses
 valid_losses
 
-history <- data.frame(epoch = as.factor(1:n_epochs), training = unlist(train_losses), validation = unlist(valid_losses)) 
+history <-
+  data.frame(
+    epoch = as.factor(1:n_epochs),
+    training = unlist(train_losses),
+    validation = unlist(valid_losses)
+  )
 history %>% pivot_longer(-epoch, names_to = "phase") %>%
   ggplot(aes(x = epoch, y = value, color = phase)) + geom_point() +
   theme_classic() +
@@ -290,66 +354,139 @@ deg2rad <- function(d) {
 }
 
 # Latitude weighted root mean squared error
+lats <-
+  tidync(paste0(
+    path,
+    "geopotential_500/geopotential_500hPa_2015_5.625deg.nc"
+  ))$transforms$lat %>%
+  select(lat) %>%
+  pull()
+lats
+lat_weights <- cos(deg2rad(lats))
+lat_weights <- lat_weights / mean(lat_weights)
+
 weighted_rmse <- function(forecast, ground_truth) {
-  error <- forecast$values - ground_truth$values
-  weights_lat <- cos(deg2rad(ground_truth$lat$values))
-  weights_lat <- weights_lat / mean(weights_lat)
-  np <- import("numpy", convert = FALSE)
-  wl <- r_to_py(weights_lat)$reshape(c(1L,1L,32L,1L))
-  e <- r_to_py(error)
-  np$sqrt((np$multiply(np$square(e), wl))$mean(axis = tuple(1L, 2L, 3L)))
+  error <- (forecast - ground_truth) ^ 2
+  for (i in seq_along(lat_weights)) {
+    error[, i, , ] <- error[, i, , ] * lat_weights[i]
+  }
+  apply(error, 4, mean) %>% sqrt()
 }
 
 
 # Weekly climatology ----------------------------------------------------
+train_file <-
+  paste0(path,
+         "geopotential_500/geopotential_500hPa_2015_5.625deg.nc")
 
-train_xr <- xr$merge(list(t850_train, z500_train))
-# https://en.wikipedia.org/wiki/ISO_week_date
+times_train <-
+  (tidync(train_file) %>% activate("D2") %>% hyper_array())$time
 
-weekly_averages <- train_xr$groupby("time.week")$mean("time")
+time_unit_train <- ncmeta::nc_atts(train_file, "time") %>%
+  tidyr::unnest(cols = c(value)) %>%
+  dplyr::filter(name == "units")
 
-test_xr <- xr$merge(list(t850_test, z500_test))
-test_time <- test_xr$time
+time_unit_train
+time_parts_train <-
+  RNetCDF::utcal.nc(time_unit_train$value, times_train)
 
-fc_list <- vector(mode = "list", length = test_time$size)
-for (t in 1:test_time$size) {
-  fc_list[[t]] <- weekly_averages$sel(week = test_time[t-1]$time.week)
+iso_train <- ISOdate(
+  time_parts_train[, "year"],
+  time_parts_train[, "month"],
+  time_parts_train[, "day"],
+  time_parts_train[, "hour"],
+  time_parts_train[, "minute"],
+  time_parts_train[, "second"]
+)
+
+isoweeks_train <- map(iso_train, isoweek) %>% unlist()
+
+train_by_week <- apply(train_all, c(2, 3, 4), function(x) {
+  tapply(x, isoweeks_train, function(y) {
+    mean(y)
+  })
+})
+dim(train_by_week)
+
+test_file <-
+  paste0(path,
+         "geopotential_500/geopotential_500hPa_2017_5.625deg.nc")
+
+times_test <-
+  (tidync(test_file) %>% activate("D2") %>% hyper_array())$time
+
+time_unit_test <- ncmeta::nc_atts(test_file, "time") %>%
+  tidyr::unnest(cols = c(value)) %>%
+  dplyr::filter(name == "units")
+
+time_unit_test
+time_parts_test <-
+  RNetCDF::utcal.nc(time_unit_test$value, times_test)
+
+iso_test <- ISOdate(
+  time_parts_test[, "year"],
+  time_parts_test[, "month"],
+  time_parts_test[, "day"],
+  time_parts_test[, "hour"],
+  time_parts_test[, "minute"],
+  time_parts_test[, "second"]
+)
+
+isoweeks_test <- map(iso_test, isoweek) %>% unlist()
+
+climatology_forecast <- test_all
+
+for (i in 1:dim(climatology_forecast)[1]) {
+  week <- isoweeks_test[i]
+  lookup <- train_by_week[week, , ,]
+  climatology_forecast[i, , , ] <- lookup
 }
 
-weekly_clim_preds <- xr$concat(fc_list, dim = test_time)
-
-wrmse <- weighted_rmse(weekly_clim_preds$to_array(), test_xr$to_array())
+wrmse <-
+  weighted_rmse(climatology_forecast, test_all)
 # result reported on github uses weekly climatology from whole dataset
-#[  4.0963539  983.51442889]
-
+# 974.499176   4.092189
 
 
 # persistence forecast ----------------------------------------------------
 
-persistence_forecast <- test_xr$isel(time = builtins$slice(0L, as.integer(-lead_time)))
-sel <- test_xr$isel(time = builtins$slice(as.integer(lead_time), test_xr$time$size))
-wrmse <- weighted_rmse(persistence_forecast$to_array(), sel$to_array())
-# [  4.2913616  935.91602924]
-
+persistence_forecast <-
+  test_all[1:(dim(test_all)[1] - lead_time), , , ]
+test_period <- test_all[(lead_time + 1):dim(test_all)[1], , , ]
+wrmse <- weighted_rmse(persistence_forecast, test_period)
+# 937.549349   4.319022
 
 # CNN forecasts -------------------------------------------------------------
 
-test_loss <- tf$keras$metrics$Mean(name='test_loss')
+test_loss <- tf$keras$metrics$Mean(name = 'test_loss')
 
-preds_list <- vector(mode = "list", length = dim(test)[1])
+test_wrmses <- c()
 
-test_step <- function(test_batch) {
+test_step <- function(test_batch, batch_index) {
   predictions <- model(test_batch[[1]])
   l <- loss(test_batch[[2]], predictions)
   
+  predictions <- predictions %>% as.array()
+  predictions[, , , 1] <-
+    predictions[, , , 1] * level_sds[1] + level_means[1]
+  predictions[, , , 2] <-
+    predictions[, , , 2] * level_sds[2] + level_means[2]
+  
+  test_wrmses <-
+    c(test_wrmses, weighted_rmse(predictions, test_all[batch_index:(batch_index + 31), , , ]))
   test_loss(l)
 }
 
-test_iterator <- as_iterator(test_ds) 
+test_ds <- test_ds %>% dataset_take(64)
+test_iterator <- as_iterator(test_ds)
+
+batch_index <- 0
 while (TRUE) {
-  
+  test_batch <- test_iterator %>% iter_next()
+  if (is.null(test_batch))
+    break
+  batch_index <- batch_index + 1
+  test_step(test_batch, as.integer(batch_index))
 }
 
-# Unnormalize
-
-
+test_loss$result()
