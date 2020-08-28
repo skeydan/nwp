@@ -13,9 +13,6 @@ library(lubridate)
 # https://ropensci.org/blog/2019/11/05/tidync/
 library(tidync)
 
-
-builtins <- import_builtins(convert = FALSE)
-
 # Data prep ---------------------------------------------------------------
 
 path <- '../weatherbench/'
@@ -172,9 +169,9 @@ periodic_padding_2d <- function(pad_width,
         lon_dim <- dim(x)[3]
         pad_width <- tf$cast(self$pad_width, tf$int32)
         # wrap around for longitude
-        tf$concat(list(x[, ,-pad_width:lon_dim,],
+        tf$concat(list(x[, , -pad_width:lon_dim, ],
                        x,
-                       x[, , 1:pad_width,]),
+                       x[, , 1:pad_width, ]),
                   axis = 2L) %>%
           tf$pad(list(
             list(0L, 0L),
@@ -214,9 +211,9 @@ test_pc <- periodic_conv_2d(filters = 16, kernel_size = 5)
 # shape=(8, 32, 64, 16)
 test_pc(test_t)
 
-periodic_cnn <- function(filters = c(64, 64, 64, 64, 2),
+periodic_cnn <- function(filters = c(128, 128, 128, 128, 2),
                          kernel_size = c(5, 5, 5, 5, 5),
-                         dropout = rep(0, 5),
+                         dropout = rep(0.2, 5),
                          name = NULL) {
   keras_model_custom(name = name, function(self) {
     self$conv1 <-
@@ -290,7 +287,7 @@ valid_step <- function(valid_batch) {
 }
 
 training_loop <-
-  tf_function(autograph(function(train_ds, valid_ds, epoch) {
+  tf_function(autograph(function(train_ds, valid_ds) {
     for (train_batch in train_ds) {
       train_step(train_batch)
     }
@@ -299,52 +296,19 @@ training_loop <-
       valid_step(valid_batch)
     }
     
-    #tf$print("MSE: train: ", train_loss$result(), ", validation: ", valid_loss$result())
-    with (writer$as_default(), {
-      tf$summary$scalar("train_loss", train_loss$result(), epoch)
-      tf$summary$scalar("valid_loss", valid_loss$result(), epoch)
-    })
-    
+    tf$print("MSE: train: ", train_loss$result(), ", validation: ", valid_loss$result())
+
     train_loss$reset_states()
     valid_loss$reset_states()
     
   }))
 
-unlink("logs", recursive = TRUE)
-writer <- tf$summary$create_file_writer("logs")
-
-n_epochs <- 5
+n_epochs <- 20
 
 for (epoch in 1:n_epochs) {
   cat("Epoch: ", epoch, " -----------\n")
-  training_loop(train_ds, valid_ds, epoch)
-  writer$flush()
+  training_loop(train_ds, valid_ds)
 }
-
-acc <-
-  tb$backend$event_processing$event_accumulator$EventAccumulator("logs")
-acc$Reload()
-acc$Tags()
-train_losses <-
-  purrr::map(acc$Tensors("train_loss"), function(t)
-    tf$make_ndarray(t$tensor_proto))
-valid_losses <-
-  purrr::map(acc$Tensors("valid_loss"), function(t)
-    tf$make_ndarray(t$tensor_proto))
-train_losses
-valid_losses
-
-history <-
-  data.frame(
-    epoch = as.factor(1:n_epochs),
-    training = unlist(train_losses),
-    validation = unlist(valid_losses)
-  )
-history %>% pivot_longer(-epoch, names_to = "phase") %>%
-  ggplot(aes(x = epoch, y = value, color = phase)) + geom_point() +
-  theme_classic() +
-  scale_color_manual(values = c("#00FF7F", "#593780")) +
-  ggtitle("Mean squared error (training/validation, lead time = 3 days)")
 
 
 # Metrics -----------------------------------------------------------------
@@ -368,7 +332,7 @@ lat_weights <- lat_weights / mean(lat_weights)
 weighted_rmse <- function(forecast, ground_truth) {
   error <- (forecast - ground_truth) ^ 2
   for (i in seq_along(lat_weights)) {
-    error[, i, , ] <- error[, i, , ] * lat_weights[i]
+    error[, i, ,] <- error[, i, ,] * lat_weights[i]
   }
   apply(error, 4, mean) %>% sqrt()
 }
@@ -438,8 +402,8 @@ climatology_forecast <- test_all
 
 for (i in 1:dim(climatology_forecast)[1]) {
   week <- isoweeks_test[i]
-  lookup <- train_by_week[week, , ,]
-  climatology_forecast[i, , , ] <- lookup
+  lookup <- train_by_week[week, , , ]
+  climatology_forecast[i, , ,] <- lookup
 }
 
 wrmse <-
@@ -451,33 +415,31 @@ wrmse <-
 # persistence forecast ----------------------------------------------------
 
 persistence_forecast <-
-  test_all[1:(dim(test_all)[1] - lead_time), , , ]
-test_period <- test_all[(lead_time + 1):dim(test_all)[1], , , ]
+  test_all[1:(dim(test_all)[1] - lead_time), , ,]
+test_period <- test_all[(lead_time + 1):dim(test_all)[1], , ,]
 wrmse <- weighted_rmse(persistence_forecast, test_period)
 # 937.549349   4.319022
 
 # CNN forecasts -------------------------------------------------------------
 
-test_loss <- tf$keras$metrics$Mean(name = 'test_loss')
+test_wrmses <- data.frame()
 
-test_wrmses <- c()
+test_loss <- tf$keras$metrics$Mean(name = 'test_loss')
 
 test_step <- function(test_batch, batch_index) {
   predictions <- model(test_batch[[1]])
   l <- loss(test_batch[[2]], predictions)
   
   predictions <- predictions %>% as.array()
-  predictions[, , , 1] <-
-    predictions[, , , 1] * level_sds[1] + level_means[1]
-  predictions[, , , 2] <-
-    predictions[, , , 2] * level_sds[2] + level_means[2]
+  predictions[, , , 1] <- predictions[, , , 1] * level_sds[1] + level_means[1]
+  predictions[, , , 2] <- predictions[, , , 2] * level_sds[2] + level_means[2]
   
-  test_wrmses <-
-    c(test_wrmses, weighted_rmse(predictions, test_all[batch_index:(batch_index + 31), , , ]))
+  wrmse <- weighted_rmse(predictions, test_all[batch_index:(batch_index + 31), , ,])
+  test_wrmses <<- test_wrmses %>% bind_rows(c(z = wrmse[1], temp = wrmse[2]))
+  
   test_loss(l)
 }
 
-test_ds <- test_ds %>% dataset_take(64)
 test_iterator <- as_iterator(test_ds)
 
 batch_index <- 0
@@ -490,3 +452,8 @@ while (TRUE) {
 }
 
 test_loss$result()
+
+test_wrmses$z  %>% summary()
+
+test_wrmses$temp  %>% summary()
+
