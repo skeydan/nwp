@@ -1,6 +1,8 @@
 # mainly a port of
 # https://github.com/pangeo-data/WeatherBench/blob/master/notebooks/3-cnn-example.ipynb
 
+Sys.setenv(CUDA_VISIBLE_DEVICES=-1)
+
 library(reticulate)
 library(tensorflow)
 library(keras)
@@ -211,7 +213,7 @@ test_pc <- periodic_conv_2d(filters = 16, kernel_size = 5)
 # shape=(8, 32, 64, 16)
 test_pc(test_t)
 
-periodic_cnn <- function(filters = c(128, 128, 128, 128, 2),
+periodic_cnn <- function(filters = c(64, 64, 64, 64, 2),
                          kernel_size = c(5, 5, 5, 5, 5),
                          dropout = rep(0.2, 5),
                          name = NULL) {
@@ -303,13 +305,12 @@ training_loop <-
     
   }))
 
-n_epochs <- 20
+n_epochs <- 10
 
 for (epoch in 1:n_epochs) {
   cat("Epoch: ", epoch, " -----------\n")
   training_loop(train_ds, valid_ds)
 }
-
 
 # Metrics -----------------------------------------------------------------
 
@@ -451,9 +452,11 @@ while (TRUE) {
   test_step(test_batch, as.integer(batch_index))
 }
 
-test_loss$result()
+test_loss$result() %>% as.numeric()
 
 test_wrmses$z  %>% summary()
 
 test_wrmses$temp  %>% summary()
 
+apply(test_wrmses, 2, mean) %>% round(2)
+# weatherbench: ~ ca. 1100 / 5 (lead time 72)
